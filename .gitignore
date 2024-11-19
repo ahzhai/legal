@@ -1,2 +1,5 @@
 CLERC_data/mapping.pid2did.tsv
 .DS_Store
+chroma_db/
+__pycache__/
+testopen.py

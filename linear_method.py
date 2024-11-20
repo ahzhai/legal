@@ -9,13 +9,10 @@ print("Setting up the embedding model...")
 sentence_transformer_ef = SentenceTransformerEmbeddings(model_name="BAAI/bge-large-en-v1.5")
 print("Embedding model setup complete.")
 
-
 # Step 2: Load the vector store
 print("Setting up the Chroma vector store...")
-vectorstore = Chroma(collection_name="clerc_docs", embedding_function=sentence_transformer_ef, persist_directory="chroma_db")
+vectorstore = Chroma(collection_name="new_clerc_docs", embedding_function=sentence_transformer_ef, persist_directory="new_chroma_db")
 print("Chroma vector store setup complete.")
-
-
 
 # Get 10 random queries from the query dataset with their corresponding doc ids
 query_to_doc = {}
@@ -47,35 +44,73 @@ def getQuery(qId):
 # Get the queries from the query dataset
 queries = [(qid, getQuery(qid)) for qid in random_query_to_doc.keys()]
 
-
-# TEST OPEN AI API TO CHANGE QUERY TO BE MORE SPECIFIC
+# OpenAI client
 client = OpenAI()
-completion = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {"role": "user", "content": "write a haiku about ai"} # TODO: need to replace this with an actual prompt
-    ]
-)
-print(completion.choices[0].message.content)
-
-linear_queries = [completion.choices[0].message.content for _ in range(len(queries))] # populate some how and then 
-
 
 # Use Chroma similarity search to retrieve similar documents based on a query
 for query in queries:
-    print("Query ID: ", query[0])
-    correct_doc_id = random_query_to_doc[query[0]]
-    print("Correct document: ", correct_doc_id, "\n")
-    print("Query: ", query[1])
-    results = vectorstore.similarity_search(
-        query[1],
-        k=2
+    query_id = query[0]
+    query_text = query[1]
+    print(f"\nProcessing Query ID: {query_id}")
+    print(f"Query: {query_text}")
+
+    # Perform similarity search
+    results = vectorstore.similarity_search(query_text, k=5)
+
+    # Create a structured dictionary of retrieved documents
+    retrieved_docs = {
+        result.metadata["doc_id"]: result.page_content for result in results
+    }
+
+    print(f"Retrieved Documents: {list(retrieved_docs.keys())}")
+    for doc_id, doc_text in retrieved_docs.items():
+        print(f"Document ID: {doc_id}, Text Length: {len(doc_text)}")
+
+    # Generate a refined query using the first prompt
+    first_prompt = [
+        {"role": "system", "content": "You are an assistant to a lawyer writing legal analyses who needs to find case documents to support their texts."},
+        {"role": "user", "content": f"""
+        You are given a query that is taken from a legal case document with its citation in the middle removed.
+        Your job is to generate additional questions that will help find the relevant document of this query,
+        which is defined as the document its central citation cites to.
+
+        Query: {query_text}
+
+        Retrieved Documents:
+        {retrieved_docs}
+
+        Generate another question building on top of this query that will help a lawyer identify the most relevant document cited in this query.
+        Ideally, a document is cited because of its similarity of facts to the query case, but the exact events that occurred in the relevant document
+        will not be the same as the query case. The question should prompt the lawyer to achieve the goal of finding the document that is being cited in the query.
+        """},
+    ]
+    completion = client.chat.completions.create(
+        model="gpt-4o-mini", # 200,000 token limit
+        messages=first_prompt
     )
-    print("Results: ", results)
-    doc_ids = [result.metadata["doc_id"] for result in results]
-    print("Found documents: ", doc_ids)
-    print("document: ", results[0].page_content)
+    refined_query = completion.choices[0].message.content
+    print(f"Refined Query: {refined_query}")
 
+    # Second LLM prompt to identify the most relevant document
+    second_prompt = [
+        {"role": "system", "content": "You are an assistant to a lawyer writing legal analyses who needs to find case documents to support their texts."},
+        {"role": "user", "content": f"""
+        Using the refined query below, determine which document from the following retrieved documents is most relevant to the query (you must select one document):
+
+        Refined Query: {refined_query}
+
+        Retrieved Documents (JSON format):
+        {retrieved_docs}
+
+        Output the ID of the most relevant document and explain why it is the most relevant.
+        """},
+    ]
+    second_completion = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=second_prompt
+    )
+    llm_response = second_completion.choices[0].message.content
+    print(f"LLM Response: {llm_response}")
+
+    # Break after first query for testing purposes
     break
-    
-

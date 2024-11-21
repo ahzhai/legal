@@ -76,7 +76,7 @@ for query in queries:
     else:
         right_half_query = query_text  # Fallback to the full query if "REDACTED" is not found
 
-    # Perform a second similarity search using the left half of the query
+    # Perform a second similarity search using the right half of the query
     second_results = vectorstore.similarity_search(right_half_query, k=10)
     second_retrieved_docs = {
         result.metadata["doc_id"]: result.page_content for result in second_results
@@ -89,7 +89,7 @@ for query in queries:
         #     if result.metadata["doc_id"] == correct_doc_id:
         #         print(result.page_content)
         #         break
-        print("Correct document found in the second retrieval step with the left half query.")
+        print("Correct document found in the second retrieval step with the right half query.")
     else:
         print("Correct document still not found after refinement.")
 

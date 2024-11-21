@@ -14,103 +14,111 @@ print("Setting up the Chroma vector store...")
 vectorstore = Chroma(collection_name="new_clerc_docs", embedding_function=sentence_transformer_ef, persist_directory="new_chroma_db")
 print("Chroma vector store setup complete.")
 
-# Get 10 random queries from the query dataset with their corresponding doc ids
-query_to_doc = {}
-with open("processed_CLERC/queryIdToDocId.txt", "r") as f:
-    pairs = [line.strip().split('\t') for line in f.readlines()]
-    query_to_doc = {qid: did for qid, did in pairs}
+# # Get 10 random queries from the query dataset with their corresponding doc ids
+# query_to_doc = {}
+# with open("processed_CLERC/queryIdToDocId.txt", "r") as f:
+#     pairs = [line.strip().split('\t') for line in f.readlines()]
+#     query_to_doc = {qid: did for qid, did in pairs}
 
-random_pairs = random.sample(list(query_to_doc.items()), 10)
-random_query_to_doc = dict(random_pairs)
+# random_pairs = random.sample(list(query_to_doc.items()), 10)
+# random_query_to_doc = dict(random_pairs)
+random_query_to_doc = {'1732': '640953', '962': '6106988', '96': '6187104', '1328': '5403601', '4455': '719610', '3257': '180535', '3786': '1767540', '3298': '5411644', '3133': '9392759', '4833': '3990383'}
 print("10 random query-doc pairs: ", random_query_to_doc)
 
-# Load query dataset - modify this section to load as a list instead of streaming
+# Load query dataset
 queryDataset = load_dataset(
     "jhu-clsp/CLERC",
     data_files={"data": "queries/test.single-removed.indirect.tsv"},
-    streaming=False,  # Changed to False
+    streaming=False,
     delimiter="\t"
 )["data"]
 
 def getQuery(qId):
-    for sample in queryDataset:  # Iterate over the dataset directly
+    for sample in queryDataset:
         keys = list(sample.keys())
         queryId = str(sample[keys[0]])
         if queryId == qId:
             header = keys[1]
             return sample[header]
-    return None  # Add explicit return None if query not found
+    return None
 
-# Get the queries from the query dataset
+# Get the queries
 queries = [(qid, getQuery(qid)) for qid in random_query_to_doc.keys()]
 
 # OpenAI client
 client = OpenAI()
 
-# Use Chroma similarity search to retrieve similar documents based on a query
+# Use Chroma similarity search and incorporate LLM refinement if needed
 for query in queries:
     query_id = query[0]
     query_text = query[1]
     print(f"\nProcessing Query ID: {query_id}")
     print(f"Query: {query_text}")
 
-    # Perform similarity search
-    results = vectorstore.similarity_search(query_text, k=5)
+    correct_doc_id = random_query_to_doc[query_id]
 
-    # Create a structured dictionary of retrieved documents
+    # Perform the initial similarity search
+    results = vectorstore.similarity_search(query_text, k=10)
     retrieved_docs = {
         result.metadata["doc_id"]: result.page_content for result in results
     }
+    doc_ids = list(retrieved_docs.keys())
 
-    print(f"Retrieved Documents: {list(retrieved_docs.keys())}")
-    for doc_id, doc_text in retrieved_docs.items():
-        print(f"Document ID: {doc_id}, Text Length: {len(doc_text)}")
+    print(f"Correct Document ID: {correct_doc_id}")
+    print(f"Retrieved Document IDs: {doc_ids}")
 
-    # Generate a refined query using the first prompt
+    if correct_doc_id in doc_ids:
+        print("Correct document found in the baseline retrieval step.")
+        continue  # Skip to the next query if the correct document is found
+
+    print("Correct document not found in the baseline retrieval. Proceeding with LLM refinement.")
+
+    # Generate a refined query using the LLM
     first_prompt = [
         {"role": "system", "content": "You are an assistant to a lawyer writing legal analyses who needs to find case documents to support their texts."},
         {"role": "user", "content": f"""
-        You are given a query that is taken from a legal case document with its citation in the middle removed.
-        Your job is to generate additional questions that will help find the relevant document of this query,
-        which is defined as the document its central citation cites to.
+        You are given a query that is taken from a legal case document with its citation in the middle removed and replaced with "REDACTED".
+        In the first attempt, the retrieved documents from an embedding-based semantic similarity search did not match the correct document or provide sufficient relevance to the query.
+
+        Your job is to generate a new question that:
+        1. Builds on the original query while retaining key unique entities or critical legal terminology to preserve the specificity required for semantic similarity search.
+        2. Explores alternative angles, related principles, or broader contexts to increase the likelihood of retrieving the correct document.
+        3. Avoids restating or slightly rephrasing the original query in ways that are likely to retrieve the same irrelevant results.
+        4. Prioritizes the creation of a concise, standalone question that is semantically distinct from the original query and can directly improve retrieval results when used in an embedding-based search.
+
+        **Note**: The previously retrieved documents were not accurate, so this new question will be fed into a second round of semantic similarity search to attempt to find the correct document.
 
         Query: {query_text}
 
-        Retrieved Documents:
+        Previously Retrieved Documents (incorrect results):
         {retrieved_docs}
 
-        Generate another question building on top of this query that will help a lawyer identify the most relevant document cited in this query.
-        Ideally, a document is cited because of its similarity of facts to the query case, but the exact events that occurred in the relevant document
-        will not be the same as the query case. The question should prompt the lawyer to achieve the goal of finding the document that is being cited in the query.
+        Generate a new question that balances retaining the specificity of unique entities while exploring a fresh perspective, ensuring it can improve retrieval results in the semantic similarity search.
         """},
     ]
     completion = client.chat.completions.create(
-        model="gpt-4o-mini", # 200,000 token limit
+        model="gpt-4o-mini",
         messages=first_prompt
     )
-    refined_query = completion.choices[0].message.content
+    refined_query = completion.choices[0].message.content.strip()
     print(f"Refined Query: {refined_query}")
 
-    # Second LLM prompt to identify the most relevant document
-    second_prompt = [
-        {"role": "system", "content": "You are an assistant to a lawyer writing legal analyses who needs to find case documents to support their texts."},
-        {"role": "user", "content": f"""
-        Using the refined query below, determine which document from the following retrieved documents is most relevant to the query (you must select one document):
+    # # Append the refined query to the original query
+    # combined_query = f"{refined_query} {query_text}"
+    # print(f"Combined Query: {combined_query}")
 
-        Refined Query: {refined_query}
+    # Perform a second similarity search with the combined query
+    second_results = vectorstore.similarity_search(refined_query, k=10)
+    second_retrieved_docs = {
+        result.metadata["doc_id"]: result.page_content for result in second_results
+    }
+    second_doc_ids = list(second_retrieved_docs.keys())
 
-        Retrieved Documents (JSON format):
-        {retrieved_docs}
+    print(f"Second Retrieved Document IDs: {second_doc_ids}")
+    if correct_doc_id in second_doc_ids:
+        print("Correct document found in the second retrieval step with the combined query.")
+    else:
+        print("Correct document still not found after refinement.")
 
-        Output the ID of the most relevant document and explain why it is the most relevant.
-        """},
-    ]
-    second_completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=second_prompt
-    )
-    llm_response = second_completion.choices[0].message.content
-    print(f"LLM Response: {llm_response}")
-
-    # Break after first query for testing purposes
-    break
+    # Break after processing one query for testing purposes
+    # break

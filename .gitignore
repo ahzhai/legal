@@ -3,3 +3,4 @@ CLERC_data/mapping.pid2did.tsv
 chroma_db/
 __pycache__/
 testopen.py
+new_chroma_db/

@@ -4,3 +4,4 @@ chroma_db/
 __pycache__/
 testopen.py
 new_chroma_db/
+chroma_db_passages/

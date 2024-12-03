@@ -5,8 +5,8 @@ from openai import OpenAI
 import random
 import csv
 
-number_queries = 50
-k_value = 20
+number_queries = 20
+k_value = 10
 temp_value = 0.5
 
 # Step 1: Set up the embedding model
@@ -70,7 +70,7 @@ for query in queries:
     # print("Query: ", query[1])
     results = vectorstore.similarity_search(
         query[1],
-        k=k_value # number of passages to retrieve (20 works better than 10)
+        k=2*k_value 
     )
     # print("Results: ", results)
     passage_ids = [result.metadata["passage_id"] for result in results]
@@ -82,8 +82,9 @@ for query in queries:
     number_correct_first += number_correct
     print("Number correct: ", number_correct)
 
-    precisions_first.append(number_correct / len(passage_ids))
-    recalls_first.append(number_correct / len(correct_passage_ids))
+    if number_correct > 0:
+        precisions_first.append(number_correct / len(passage_ids))
+        recalls_first.append(number_correct / len(correct_passage_ids))
 
     # Generate a refined query using the LLM
     first_prompt = [
@@ -125,12 +126,19 @@ for query in queries:
     # print(f"Combined Query: {combined_query}")
 
     # Perform a second similarity search with the combined query
-    second_results = vectorstore.similarity_search(refined_query, k=20)
+    second_results = vectorstore.similarity_search(refined_query, k=k_value)
     second_retrieved_passages = {
         result.metadata["passage_id"]: result.page_content for result in second_results
     }
     second_passage_ids = [result.metadata["passage_id"] for result in second_results]
     #print("Second found passages: ", second_passage_ids)
+    added = 0
+    for elem in passage_ids:
+        if added < 10:
+            second_passage_ids.append(elem)
+            added += 1
+        else:
+            break
 
     second_correctly_retrieved = [passage_id for passage_id in second_passage_ids if passage_id in correct_passage_ids]
     #print("Second correctly retrieved: ", second_correctly_retrieved)
@@ -138,8 +146,9 @@ for query in queries:
     print("Second number correct: ", second_number_correct, "\n")
     number_correct_second += second_number_correct
 
-    precisions_second.append(second_number_correct / len(second_passage_ids))
-    recalls_second.append(second_number_correct / len(correct_passage_ids))
+    if second_number_correct > 0:
+        precisions_second.append(second_number_correct / len(second_passage_ids))
+        recalls_second.append(second_number_correct / len(correct_passage_ids))
 
     if number_correct < second_number_correct:
         number_improved += 1
@@ -168,8 +177,8 @@ print("Number worsened: ", number_worsened)
 print("Number same: ", number_same) 
 
 # write to csv file
-with open("passage_linear_method_results.csv", "a") as f:
+with open("passage_linear_method_and_baseline_joined_results.csv", "a") as f:
     writer = csv.writer(f)
     if f.tell() == 0:  # Only write header if file is empty
         writer.writerow(["Number queries", "k value", "Temperature value", "Number correct first", "Number correct second", "Precision first", "Recall first", "Precision second", "Recall second", "Number improved", "Number worsened", "Number same"])
-    writer.writerow([number_queries, k_value, temp_value, number_correct_first, number_correct_second, precisions_first, recalls_first, precisions_second, recalls_second, number_improved, number_worsened, number_same])
+    writer.writerow([2*number_queries, k_value, temp_value, number_correct_first, number_correct_second, precisions_first, recalls_first, precisions_second, recalls_second, number_improved, number_worsened, number_same])

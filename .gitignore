@@ -5,3 +5,4 @@ __pycache__/
 testopen.py
 new_chroma_db/
 chroma_db_passages/
+passage_linear_method_results.csv

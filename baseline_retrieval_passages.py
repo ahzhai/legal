@@ -47,6 +47,8 @@ def getQuery(qId):
 queries = [(qid, getQuery(qid)) for qid in random_query_to_passage.keys()]
 
 average_correct = 0
+precisions = []
+recalls = []
 # Use Chroma similarity search to retrieve similar documents based on a query
 for query in queries:
     print("Query ID: ", query[0])
@@ -64,9 +66,15 @@ for query in queries:
     correctly_retrieved = [passage_id for passage_id in passage_ids if passage_id in correct_passage_ids]
     print("Correctly retrieved: ", correctly_retrieved)
     number_correct = len(correctly_retrieved)
-    print("Number correct: ", number_correct, "\n")
+    print("Number correct: ", number_correct)
     average_correct += number_correct
+    precisions.append(number_correct / len(passage_ids))
+    recalls.append(number_correct / len(correct_passage_ids))
     # print("passage: ", results[0].page_content)
+    print("Precision: ", number_correct / len(passage_ids))
+    print("Recall: ", number_correct / len(correct_passage_ids), "\n")
 
 average_correct /= len(queries)
 print("Average number correct: ", average_correct)
+print("Precision: ", sum(precisions) / len(precisions))
+print("Recall: ", sum(recalls) / len(recalls))

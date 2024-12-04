@@ -7,7 +7,7 @@ import csv
 
 number_queries = 20
 k_value = 5  # Top passages retrieved per query refinement
-temp_value = 0.5
+temp_value = 1
 
 # Step 1: Set up the embedding model
 print("Setting up the embedding model...")
@@ -50,27 +50,10 @@ queries = [(qid, getQuery(qid)) for qid in random_query_to_passage.keys()]
 client = OpenAI()
 
 # Initialize metrics
-number_correct_baseline = 0
-precisions_baseline = []
-recalls_baseline = []
+precision_list = []
+recall_list = []
 
-# Step 4: Define LLM reflection prompt
-reflection_prompt_template = """
-You are an assistant to a lawyer writing legal analyses. 
-Below is a list of passages retrieved for a legal query. 
-For each passage, reflect and assign a score from 1 to 10 based on how likely it is the correct cited passage in the query. 
-A score of 10 means it is highly likely, and a score of 1 means it is highly unlikely.
-
-Query: {query}
-
-Passages:
-{passages}
-
-Output:
-For each passage, return its ID and a score.
-"""
-
-# Step 5: Retrieval and Evaluation
+# Step 4: Retrieval and Evaluation
 for query_id, query_text in queries:
     print(f"\nQuery ID: {query_id}")
     print(f"Query Text: {query_text}")
@@ -79,7 +62,7 @@ for query_id, query_text in queries:
 
     # Baseline retrieval
     baseline_results = vectorstore.similarity_search(query_text, k=3 * k_value)
-    baseline_passages = [{"id": res.metadata["passage_id"], "content": res.page_content} for res in baseline_results]
+    baseline_passage_ids = [res.metadata["passage_id"] for res in baseline_results]
 
     # Refined retrieval with 3 LLM calls
     refined_queries = []
@@ -124,55 +107,43 @@ for query_id, query_text in queries:
         refined_query = refined_completion.choices[0].message.content.strip()
         refined_queries.append(refined_query)
 
-    refined_results = []
-    for refined_query in refined_queries:  # Retrieve passages for each refined query
+    # Perform retrieval for each refined query
+    refined_passage_ids = set()
+    for refined_query in refined_queries:
         results = vectorstore.similarity_search(refined_query, k=k_value)
-        refined_results.extend(
-            [{"id": res.metadata["passage_id"], "content": res.page_content} for res in results]
-        )
+        refined_passage_ids.update([res.metadata["passage_id"] for res in results])
 
-    # Combine and reflect on passages
-    all_passages = baseline_passages + refined_results
-    passage_text = "\n\n".join([f"ID: {p['id']}\nContent: {p['content'][:200]}..." for p in all_passages])
-    reflection_prompt = reflection_prompt_template.format(query=query_text, passages=passage_text)
+    # Combine results
+    final_passage_ids = list(set(baseline_passage_ids).intersection(refined_passage_ids))
 
-    reflection_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": reflection_prompt}],
-        temperature=temp_value
-    )
-    reflection_scores = reflection_response.choices[0].message.content.strip().split("\n")
-
-    # Aggregate top 20 passages by score
-    scored_passages = []
-    for score_line in reflection_scores:
-        try:
-            passage_id, score = score_line.split(":")
-            scored_passages.append((passage_id.strip(), int(score.strip())))
-        except ValueError:
-            continue
-
-    top_scored_passages = sorted(scored_passages, key=lambda x: x[1], reverse=True)[:20]
+    # Fill remaining spots to reach top 20
+    additional_ids = [pid for pid in baseline_passage_ids if pid not in final_passage_ids]
+    while len(final_passage_ids) < 20 and additional_ids:
+        final_passage_ids.append(additional_ids.pop(0))
 
     # Evaluate performance
-    top_passage_ids = [str(p[1]) for p in top_scored_passages]
-    print("Correct Passage IDs: ", correct_passage_ids)
-    print("Top Passage IDs: ", top_passage_ids)
-    correctly_retrieved = [pid for pid in top_passage_ids if pid in correct_passage_ids]
+    correctly_retrieved = [pid for pid in final_passage_ids if pid in correct_passage_ids]
+    precision = len(correctly_retrieved) / len(final_passage_ids)
+    recall = len(correctly_retrieved) / len(correct_passage_ids)
 
-    # precision = len(correctly_retrieved) / len(top_passage_ids)
-    # recall = len(correctly_retrieved) / len(correct_passage_ids)
+    precision_list.append(precision)
+    recall_list.append(recall)
 
-    # precisions_baseline.append(precision)
-    # recalls_baseline.append(recall)
-
-    # print(f"Correctly Retrieved: {correctly_retrieved}")
-    print("Number Correctly Retrieved: ", len(correctly_retrieved))
-    # print(f"Precision: {precision}, Recall: {recall}")
+    print(f"Final Passage IDs: {final_passage_ids}")
+    print(f"Correctly Retrieved: {correctly_retrieved}")
+    print(f"Precision: {precision}, Recall: {recall}")
 
 # Step 6: Summary
-avg_precision = sum(precisions_baseline) / len(precisions_baseline)
-avg_recall = sum(recalls_baseline) / len(recalls_baseline)
+avg_precision = sum(precision_list) / len(precision_list)
+avg_recall = sum(recall_list) / len(recall_list)
 
 print(f"\nAverage Precision: {avg_precision}")
 print(f"Average Recall: {avg_recall}")
+
+# Save results to CSV
+with open("tree_retrieval_results.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["Query ID", "Precision", "Recall"])
+    for idx, (precision, recall) in enumerate(zip(precision_list, recall_list)):
+        writer.writerow([queries[idx][0], precision, recall])
+    writer.writerow(["Average", avg_precision, avg_recall])

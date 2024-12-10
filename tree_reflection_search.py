@@ -1,92 +1,32 @@
+import random
+import csv
+import math
+import logging
+from typing import List, Optional
+from collections import deque
 from datasets import load_dataset
 from langchain.vectorstores import Chroma
 from langchain_community.embeddings import SentenceTransformerEmbeddings
-from openai import OpenAI
-import random
-import csv
+from langchain_openai import ChatOpenAI
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import BaseOutputParser
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from pydantic import BaseModel, Field
 
-number_queries = 20
-k_value = 5  # Top passages retrieved per query refinement
-temp_value = 0.5
+logging.basicConfig()
+logging.getLogger("langchain.retrievers.multi_query").setLevel(logging.INFO)
 
-# Step 1: Set up the embedding model
-print("Setting up the embedding model...")
-sentence_transformer_ef = SentenceTransformerEmbeddings(model_name="BAAI/bge-large-en-v1.5")
-print("Embedding model setup complete.")
+# Customized Output Parser for MultiQueryRetriever
+class LineListOutputParser(BaseOutputParser[List[str]]):
+    def parse(self, text: str) -> List[str]:
+        lines = text.strip().split("\n")
+        return list(filter(None, lines))
 
-# Step 2: Load the vector store
-print("Setting up the Chroma vector store...")
-vectorstore = Chroma(collection_name="clerc_passages", embedding_function=sentence_transformer_ef, persist_directory="chroma_db_passages")
-print("Chroma vector store setup complete.")
-
-# Step 3: Load query dataset and get random queries
-query_to_passage = {}
-with open("processed_passages/queryIdToPassageIds.txt", "r") as f:
-    pairs = [line.strip().split('\t') for line in f.readlines()]
-    query_to_passage = {qid: pid for qid, pid in pairs}
-
-random_pairs = random.sample(list(query_to_passage.items()), number_queries)
-random_query_to_passage = dict(random_pairs)
-
-queryDataset = load_dataset(
-    "jhu-clsp/CLERC",
-    data_files={"data": "queries/test.single-removed.indirect.tsv"},
-    streaming=False,
-    delimiter="\t"
-)["data"]
-
-def getQuery(qId):
-    for sample in queryDataset:
-        keys = list(sample.keys())
-        queryId = str(sample[keys[0]])
-        if queryId == qId:
-            header = keys[1]
-            return sample[header]
-    return None
-
-queries = [(qid, getQuery(qid)) for qid in random_query_to_passage.keys()]
-
-# OpenAI client
-client = OpenAI()
-
-# Initialize metrics
-number_correct_baseline = 0
-precisions_baseline = []
-recalls_baseline = []
-
-# Step 4: Define LLM reflection prompt
-reflection_prompt_template = """
-You are an assistant to a lawyer writing legal analyses. 
-Below is a list of passages retrieved for a legal query. 
-For each passage, reflect and assign a score from 1 to 10 based on how likely it is the correct cited passage in the query. 
-A score of 10 means it is highly likely, and a score of 1 means it is highly unlikely.
-
-Query: {query}
-
-Passages:
-{passages}
-
-Output:
-For each passage, return its ID and a score.
-"""
-
-# Step 5: Retrieval and Evaluation
-for query_id, query_text in queries:
-    print(f"\nQuery ID: {query_id}")
-    print(f"Query Text: {query_text}")
-
-    correct_passage_ids = random_query_to_passage[query_id]
-
-    # Baseline retrieval
-    baseline_results = vectorstore.similarity_search(query_text, k=3 * k_value)
-    baseline_passages = [{"id": res.metadata["passage_id"], "content": res.page_content} for res in baseline_results]
-
-    # Refined retrieval with 3 LLM calls
-    refined_queries = []
-    for i in range(3):  # Generate 3 refined queries
-        refined_prompt = [
-            {"role": "system", "content": "You are an assistant to a lawyer writing legal analyses."},
-            {"role": "user", "content": f"""
+# Customized Prompt for MultiQueryRetriever
+QUERY_PROMPT = PromptTemplate(
+    input_variables=["question"],
+    template="""
         Your task is to generate five different versions of the given user question to retrieve relevant documents from a vector 
         database. By generating multiple perspectives on the user question, your goal is to help
         the user overcome some of the limitations of the distance-based similarity search. 
@@ -111,68 +51,227 @@ for query_id, query_text in queries:
         Your Task:
         Refine the query below to enhance its specificity, focus, and semantic alignment with relevant legal passages. 
 
-        Original query: {query_text}
+        Original query: {question}
         Deliverable: Provide five alternative refined queries, each on a new line. Only output the refined query text without any additional context or explanations.
         Each refined query should retain critical legal details, incorporate specific statutory or case law references where applicable, and ensure semantic alignment to retrieve relevant passages effectively.
-        """}
-        ]
-        refined_completion = client.chat.completions.create(
-            model="gpt-4o",
-            messages=refined_prompt,
-            temperature=temp_value
-        )
-        refined_query = refined_completion.choices[0].message.content.strip()
-        refined_queries.append(refined_query)
+    """
+)
 
-    refined_results = []
-    for refined_query in refined_queries:  # Retrieve passages for each refined query
-        results = vectorstore.similarity_search(refined_query, k=k_value)
-        refined_results.extend(
-            [{"id": res.metadata["passage_id"], "content": res.page_content} for res in results]
-        )
+# Set up the embedding model
+print("Setting up the embedding model...")
+embedding_model = SentenceTransformerEmbeddings(model_name="BAAI/bge-large-en-v1.5")
+print("Embedding model setup complete.")
 
-    # Combine and reflect on passages
-    all_passages = baseline_passages + refined_results
-    passage_text = "\n\n".join([f"ID: {p['id']}\nContent: {p['content'][:200]}..." for p in all_passages])
-    reflection_prompt = reflection_prompt_template.format(query=query_text, passages=passage_text)
+# Set up the Chroma vector store
+print("Setting up the Chroma vector store...")
+vectorstore = Chroma(
+    collection_name="clerc_passages",
+    embedding_function=embedding_model,
+    persist_directory="chroma_db_passages"
+)
+print("Chroma vector store setup complete.")
 
-    reflection_response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": reflection_prompt}],
-        temperature=temp_value
+# Initialize LLM and MultiQueryRetriever
+llm = ChatOpenAI(temperature=0.5)
+output_parser = LineListOutputParser()
+llm_chain = QUERY_PROMPT | llm | output_parser
+retriever = MultiQueryRetriever(
+    retriever=vectorstore.as_retriever(),
+    llm_chain=llm_chain,
+    parser_key="lines"
+)
+
+# Tree Search Classes and Methods
+class Reflection(BaseModel):
+    reflections: str = Field(description="Critique and score of response.")
+    score: int = Field(description="Score from 0-10 for response quality.", gte=0, lte=10)
+    found_solution: bool = Field(description="Indicates if a solution is found.")
+
+    def as_message(self):
+        return HumanMessage(content=f"Reflection: {self.reflections}\nScore: {self.score}")
+
+    @property
+    def normalized_score(self) -> float:
+        return self.score / 10.0
+
+class Node:
+    def __init__(
+        self,
+        messages: List[BaseMessage],
+        reflection: Reflection,
+        parent: Optional["Node"] = None,
+    ):
+        self.messages = messages
+        self.parent = parent
+        self.children = []
+        self.value = 0
+        self.visits = 0
+        self.reflection = reflection
+        self.depth = parent.depth + 1 if parent else 1
+        self._is_solved = reflection.found_solution if reflection else False
+        if self._is_solved:
+            self._mark_tree_as_solved()
+        self.backpropagate(reflection.normalized_score)
+
+    def upper_confidence_bound(self, exploration_weight=1.0):
+        if self.visits == 0:
+            return float('inf')
+        avg_reward = self.value / self.visits
+        exploration_term = math.sqrt(math.log(self.parent.visits) / self.visits)
+        return avg_reward + exploration_weight * exploration_term
+
+    def backpropagate(self, reward: float):
+        node = self
+        while node:
+            node.visits += 1
+            node.value = (node.value * (node.visits - 1) + reward) / node.visits
+            node = node.parent
+
+    def _mark_tree_as_solved(self):
+        node = self
+        while node:
+            node._is_solved = True
+            node = node.parent
+
+# Generate initial response (Root Node)
+def generate_initial_response(query: str, correct_passage_ids: List[str]) -> Node:
+    results = vectorstore.similarity_search(query, k=10)
+    passages = [AIMessage(content=doc.page_content) for doc in results]
+
+    # Debugging: Print retrieved passage IDs
+    retrieved_passage_ids = [doc.metadata.get("passage_id") for doc in results]
+    print(f"Initial Retrieved Passage IDs: {retrieved_passage_ids}")
+
+    correct_matches = [pid for pid in retrieved_passage_ids if pid in correct_passage_ids]
+    print(f"Number of Correctly Retrieved Passages: {len(correct_matches)}")
+
+    reflection = Reflection(
+        reflections="Initial retrieval performed.",
+        score=5,
+        found_solution=bool(correct_matches)
     )
-    reflection_scores = reflection_response.choices[0].message.content.strip().split("\n")
+    return Node(messages=[HumanMessage(content=query)] + passages, reflection=reflection)
 
-    # Aggregate top 20 passages by score
-    scored_passages = []
-    for score_line in reflection_scores:
+
+# Expand and simulate (Child Nodes) with MultiQueryRetriever Integration
+def expand_node_with_multiquery(node: Node, query: str) -> List[Node]:
+    refined_queries = retriever.invoke(query)
+    child_nodes = []
+
+    # print(f"Refined Queries: {refined_queries}")  # Debugging: Print refined queries
+
+    for refined_query in refined_queries:
         try:
-            passage_id, score = score_line.split(":")
-            scored_passages.append((passage_id.strip(), int(score.strip())))
-        except ValueError:
-            continue
+            # Ensure refined_query is a string or extract relevant content from a Document
+            if isinstance(refined_query, str):
+                refined_query_text = refined_query
+            elif hasattr(refined_query, "page_content"):  # Handle Document-like objects
+                refined_query_text = refined_query.page_content
+            else:
+                raise TypeError(f"Unexpected query type: {type(refined_query)}")
 
-    top_scored_passages = sorted(scored_passages, key=lambda x: x[1], reverse=True)[:20]
+            # Perform similarity search with the refined query text
+            results = vectorstore.similarity_search(refined_query_text, k=10)
+            print(f"Retrieved Passage IDs for Refined Query: {refined_query_text[:30]} - {[doc.metadata.get('passage_id') for doc in results]}")
 
-    # Evaluate performance
-    top_passage_ids = [str(p[1]) for p in top_scored_passages]
-    print("Correct Passage IDs: ", correct_passage_ids)
-    print("Top Passage IDs: ", top_passage_ids)
-    correctly_retrieved = [pid for pid in top_passage_ids if pid in correct_passage_ids]
+            for result in results:
+                messages = node.messages + [AIMessage(content=result.page_content)]
+                reflection = Reflection(
+                    reflections="Evaluated relevance for passage.",
+                    score=7,
+                    found_solution=False
+                )
+                child_nodes.append(Node(messages=messages, reflection=reflection, parent=node))
 
-    # precision = len(correctly_retrieved) / len(top_passage_ids)
-    # recall = len(correctly_retrieved) / len(correct_passage_ids)
+        except Exception as e:
+            print(f"Error handling refined query: {refined_query}")
+            print(f"Exception: {e}")
 
-    # precisions_baseline.append(precision)
-    # recalls_baseline.append(recall)
+    return child_nodes
 
-    # print(f"Correctly Retrieved: {correctly_retrieved}")
-    print("Number Correctly Retrieved: ", len(correctly_retrieved))
-    # print(f"Precision: {precision}, Recall: {recall}")
 
-# Step 6: Summary
-avg_precision = sum(precisions_baseline) / len(precisions_baseline)
-avg_recall = sum(recalls_baseline) / len(recalls_baseline)
+# Monte Carlo Tree Search for Passage Retrieval
+def perform_lats_with_multiquery(query: str, correct_passage_ids: List[str], max_depth: int = 5) -> Node:
+    root = generate_initial_response(query, correct_passage_ids)  # Pass correct_passage_ids
+    current_node = root
+    depth = 1
 
-print(f"\nAverage Precision: {avg_precision}")
-print(f"Average Recall: {avg_recall}")
+    while depth <= max_depth and not current_node._is_solved:
+        if not current_node.children:
+            current_node.children = expand_node_with_multiquery(current_node, query)
+
+        if not current_node.children:
+            print(f"No children generated at depth {depth} for query: {query}")
+            break  # Exit the loop if no valid children are generated
+
+        current_node = max(
+            current_node.children,
+            key=lambda child: child.upper_confidence_bound()
+        )
+        depth += 1
+
+    return current_node
+
+
+
+# Load dataset for queries
+query_to_passage = {}
+with open("processed_passages/queryIdToPassageIds.txt", "r") as f:
+    pairs = [line.strip().split('\t') for line in f.readlines()]
+    query_to_passage = {qid: pid for qid, pid in pairs}
+
+queryDataset = load_dataset(
+    "jhu-clsp/CLERC",
+    data_files={"data": "queries/test.single-removed.indirect.tsv"},
+    streaming=False,
+    delimiter="\t"
+)["data"]
+
+def getQuery(qId):
+    for sample in queryDataset:
+        keys = list(sample.keys())
+        queryId = str(sample[keys[0]])
+        if queryId == qId:
+            header = keys[1]
+            return sample[header]
+    return None
+
+queries = [(qid, getQuery(qid)) for qid in query_to_passage.keys()]
+
+# Test Tree Search with MultiQuery Integration
+precisions_tree = []
+recalls_tree = []
+num_samples = 5
+sample_queries = random.sample(queries, num_samples)
+
+for query_id, query_text in sample_queries:
+    print(f"\nTesting Query ID: {query_id}")
+    print(f"Original Query: {query_text}")
+
+    correct_passage_ids = query_to_passage[query_id]
+    tree_result = perform_lats_with_multiquery(query_text, correct_passage_ids)
+    retrieved_passage_ids = [
+        msg.metadata.get("passage_id")
+        for msg in tree_result.messages
+        if hasattr(msg, "metadata") and "passage_id" in msg.metadata
+    ]
+    correct_tree = [pid for pid in retrieved_passage_ids if pid in correct_passage_ids]
+
+    print(f"Retrieved Passage IDs: {retrieved_passage_ids}")
+    print(f"Correctly Retrieved Passage IDs: {correct_tree}")
+    print(f"Number of Retrieved Passages: {len(retrieved_passage_ids)}")
+    print(f"Number of Correctly Retrieved Passages: {len(correct_tree)}")
+
+    # Calculate precision and recall
+    precision = len(correct_tree) / len(retrieved_passage_ids) if retrieved_passage_ids else 0
+    recall = len(correct_tree) / len(correct_passage_ids) if correct_passage_ids else 0
+
+    precisions_tree.append(precision)
+    recalls_tree.append(recall)
+
+# Summary of performance
+precision_tree_avg = sum(precisions_tree) / len(precisions_tree) if precisions_tree else 0
+recall_tree_avg = sum(recalls_tree) / len(recalls_tree) if recalls_tree else 0
+
+print(f"\nAverage Precision: {precision_tree_avg}")
+print(f"Average Recall: {recall_tree_avg}")
